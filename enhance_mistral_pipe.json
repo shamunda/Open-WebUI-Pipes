@@ -1,0 +1,315 @@
+"""
+title: Enhanced Mistral API Pipe
+author: Shamunda
+author_url: https://github.com/shamunda
+funding_url: https://github.com/shamunda
+version: 1.0.0
+"""
+
+from typing import List, Union, Dict, Generator, Optional
+from pydantic import BaseModel, Field
+import os
+import json
+import requests
+import time
+
+
+class Pipe:
+    class Valves(BaseModel):
+        """Configuration for Mistral API."""
+
+        MISTRAL_API_BASE_URL: str = Field(default="https://api.mistral.ai/v1")
+        MISTRAL_API_KEY: str = Field(default="")
+
+    def __init__(self):
+        self.debug_models = False
+        self.debug_stream = True
+        self.debug_errors = True
+        self.type = "manifold"
+        self.id = "mistral"
+        self.name = "mistral/"
+        self.server = "https://api.mistral.ai"
+        self.models_url = self.server + "/v1/models"
+        self.chat_url = self.server + "/v1/chat/completions"
+        self.embeddings_url = self.server + "/v1/embeddings"
+        self.temperature = 0.7
+        self.top_p = 0.9
+        self.max_tokens = 4096
+        api_key = os.getenv("MISTRAL_API_KEY", "").strip()
+        self.valves = self.Valves(MISTRAL_API_KEY=api_key)
+        self.last_request_time: float = 0.0
+        self.rate_limit_reset: float = 0.0
+        self.rate_limit_interval: float = 30.0
+        self.models = []
+
+        self.MAX_IMAGE_SIZE = 5 * 1024 * 1024
+        self.image_url = ""
+
+    def _debug(self, message: str):
+        """Prints debug messages if debug is enabled."""
+        if self.debug_errors:
+            print(message)
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Returns the headers for API requests."""
+        if not self.valves.MISTRAL_API_KEY:
+            raise ValueError("MISTRAL_API_KEY is missing or invalid.")
+        return {
+            "Authorization": f"Bearer {self.valves.MISTRAL_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    def _handle_response(self, response):
+        """Handles the response from the API request."""
+        if response.status_code != 200:
+            self._debug(f"Error response: {response.text}")
+        response.raise_for_status()
+        return response.json()
+
+    def get_mistral_models(self) -> List[Dict[str, Union[str, int, bool]]]:
+        """Fetches available Mistral models, filters, and returns unique models."""
+        if not self.valves.MISTRAL_API_KEY:
+            raise ValueError("MISTRAL_API_KEY is missing or invalid.")
+        
+        headers = self._get_headers()
+
+        try:
+            response = requests.get(self.models_url, headers=headers)
+            if response.status_code != 200:
+                self._debug(f"Models API error: {response.text}")
+                response.raise_for_status()
+            
+            self.models = response.json()["data"]
+        except requests.exceptions.RequestException as e:
+            if self.debug_errors:
+                print(f"API call failed: {e}")
+            return []
+
+        model_map = {}
+        for model in self.models:
+            if not model["capabilities"].get("completion_chat", False):
+                continue
+
+            base_id = "-".join(model["id"].split("-")[:-1])
+            is_latest = "latest" in model["id"] or "latest" in model["aliases"]
+
+            if base_id not in model_map or is_latest:
+                model_map[base_id] = model
+
+        unique_models = []
+        for base_id, model in model_map.items():
+            unique_models.append(
+                {
+                    "id": model["id"],
+                    "name": model["name"],
+                    "capabilities": model["capabilities"],
+                    "description": model["description"],
+                    "max_context_length": model["max_context_length"],
+                    "aliases": model["aliases"],
+                    "deprecation": model["deprecation"],
+                    "default_model_temperature": model["default_model_temperature"],
+                    "type": model["type"],
+                }
+            )
+
+        if self.debug_models:
+            print("Unique Models:")
+            for model in unique_models:
+                print(f"ID: {model['id']}")
+                print(f"Name: {model['name']}")
+                print(f"Capabilities: {model['capabilities']}")
+                print(f"Description: {model['description']}")
+                print(f"Max Context Length: {model['max_context_length']}")
+                print(f"Aliases: {model['aliases']}")
+                print(f"Deprecation: {model['deprecation']}")
+                print(f"Default Model Temperature: {model['default_model_temperature']}")
+                print(f"Type: {model['type']}")
+                print("-" * 40)
+
+        return unique_models
+
+    def pipes(self) -> List[dict]:
+        """Returns a list of available models."""
+        return self.get_mistral_models()
+
+    def clean_model_name(self, model_name: str) -> str:
+        """Cleans the model name by removing prefixes."""
+        if model_name.startswith("mistral_api_pipe."):
+            return model_name.removeprefix("mistral_api_pipe.")
+        elif model_name.startswith("mistral."):
+            return model_name.removeprefix("mistral.")
+        return model_name
+
+    def pipe(self, body: dict) -> Union[str, Generator[str, None, None]]:
+        """Handles a single request to the pipe."""
+        try:
+            # Fix the model name formatting
+            model = self.clean_model_name(body["model"])
+            messages = body["messages"]
+            stream = body.get("stream", False)
+            
+            # Optional parameters
+            temperature = body.get("temperature", self.temperature)
+            top_p = body.get("top_p", self.top_p)
+            max_tokens = body.get("max_tokens", self.max_tokens)
+
+            if self.debug_stream:
+                self._debug("Incoming body:")
+                self._debug(json.dumps(body, indent=2))
+
+            if stream:
+                return self.stream_response(model, messages, temperature, top_p, max_tokens)
+            return self.get_completion(model, messages, temperature, top_p, max_tokens)
+        except KeyError as e:
+            error_msg = f"Missing required key in body: {e}"
+            self._debug(error_msg)
+            return f"Error: {error_msg}"
+        except Exception as e:
+            self._debug(f"Error in pipe method: {e}")
+            return f"Error: {e}"
+
+    def stream_response(
+        self, model: str, messages: List[dict], temperature: float = None, 
+        top_p: float = None, max_tokens: int = None, retries: int = 5
+    ) -> Generator[str, None, None]:
+        """Streams a response from the Mistral API, handling rate limits."""
+        url = self.chat_url
+        
+        # Prepare the payload with optional parameters
+        payload = {
+            "model": model, 
+            "messages": messages, 
+            "stream": True
+        }
+        
+        # Add optional parameters if provided
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        self._debug(f"Streaming response from {url}")
+        self._debug(f"Payload: {json.dumps(payload, indent=2)}")
+        self._debug(f"Headers: {self._get_headers()}")
+
+        for attempt in range(retries):
+            try:
+                response = requests.post(
+                    url, json=payload, headers=self._get_headers(), stream=True
+                )
+                
+                if response.status_code != 200:
+                    self._debug(f"Stream request error: {response.status_code} - {response.text}")
+                    
+                response.raise_for_status()
+
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_data = line.decode("utf-8").lstrip("data: ")
+                            if line_data == "[DONE]":
+                                break
+                                
+                            event = json.loads(line_data)
+                            self._debug(f"Received stream event: {event}")
+
+                            delta_content = (
+                                event.get("choices", [{}])[0]
+                                .get("delta", {})
+                                .get("content")
+                            )
+                            if delta_content:
+                                yield delta_content
+
+                            if (
+                                event.get("choices", [{}])[0].get("finish_reason")
+                                == "stop"
+                            ):
+                                break
+                        except json.JSONDecodeError:
+                            self._debug(f"Failed to decode stream line: {line}")
+                            continue
+                return
+            except requests.RequestException as e:
+                if (
+                    hasattr(e, "response")
+                    and e.response.status_code == 429
+                    and attempt < retries - 1
+                ):
+                    wait_time = 2**attempt
+                    self._debug(
+                        f"Rate limited (429). Retrying after {wait_time} seconds..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    error_message = str(e)
+                    self._debug(f"Stream request failed: {error_message}")
+                    yield f"Error: {error_message}"
+                    return
+
+    def get_completion(
+        self, model: str, messages: List[dict], temperature: float = None, 
+        top_p: float = None, max_tokens: int = None, retries: int = 3
+    ) -> str:
+        """Fetches a single completion response, handling rate limits."""
+        url = self.chat_url
+        
+        # Prepare the payload with optional parameters
+        payload = {
+            "model": model, 
+            "messages": messages
+        }
+        
+        # Add optional parameters if provided
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        for attempt in range(retries):
+            try:
+                self._debug(
+                    f"Attempt {attempt + 1}: Sending completion request to {url}"
+                )
+                response = requests.post(url, json=payload, headers=self._get_headers())
+                
+                if response.status_code != 200:
+                    self._debug(f"Completion request error: {response.status_code} - {response.text}")
+                    
+                data = self._handle_response(response)
+                return data["choices"][0]["message"]["content"]
+            except requests.RequestException as e:
+                if (
+                    hasattr(e, "response")
+                    and e.response.status_code == 429
+                    and attempt < retries - 1
+                ):
+                    wait_time = 2**attempt
+                    self._debug(
+                        f"Rate limited (429). Retrying after {wait_time} seconds..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    error_message = str(e)
+                    self._debug(f"Completion request failed: {error_message}")
+                    return f"Error: {error_message}"
+    
+    def get_embeddings(self, texts: List[str], model: str = "mistral-embed") -> Dict:
+        """Gets embeddings for a list of texts."""
+        url = self.embeddings_url
+        payload = {"model": model, "input": texts}
+        
+        try:
+            response = requests.post(url, json=payload, headers=self._get_headers())
+            if response.status_code != 200:
+                self._debug(f"Embeddings request error: {response.status_code} - {response.text}")
+            
+            return self._handle_response(response)
+        except requests.RequestException as e:
+            error_message = str(e)
+            self._debug(f"Embeddings request failed: {error_message}")
+            return {"error": error_message}
